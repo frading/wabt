@@ -125,6 +125,10 @@ void PatchExprList(ExprList *exprs, Store store)
             }
         }
         break;
+        case ExprType::CallIndirect:
+            // Convert i64 table index to i32 for call_indirect
+            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+            break;
         case ExprType::MemorySize:
             it++;
             it = exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I64ExtendI32U));
@@ -160,6 +164,22 @@ void PatchExprList(ExprList *exprs, Store store)
         case ExprType::Loop:
             PatchExprList(&cast<LoopExpr>(&*it)->block.exprs, store);
             break;
+        case ExprType::If: {
+            auto if_expr = cast<IfExpr>(&*it);
+            PatchExprList(&if_expr->true_.exprs, store);
+            if (!if_expr->false_.empty()) {
+                PatchExprList(&if_expr->false_, store);
+            }
+            break;
+        }
+        case ExprType::Try: {
+            auto try_expr = cast<TryExpr>(&*it);
+            PatchExprList(&try_expr->block.exprs, store);
+            for (auto& catch_: try_expr->catches) {
+                PatchExprList(&catch_.exprs, store);
+            }
+            break;
+        }
         default:
         {}
         }
@@ -195,17 +215,23 @@ Var GenerateWrapStoreForType(Module *module, Type type)
     return Var(func_index);
 }
 
-void PatchInitExprs(ExprList *exprs)
+void PatchInitExprs(ExprList *exprs, bool convert_to_i32 = true)
 {
     for (auto it = exprs->begin(); it != exprs->end(); it++) {
         switch (it->type()) {
         case ExprType::Const: {
-            auto const_expr = cast<ConstExpr>(&*it);
-            const_expr->const_.set_u32(const_expr->const_.u32());
+            if (convert_to_i32) {
+                auto const_expr = cast<ConstExpr>(&*it);
+                const_expr->const_.set_u32(const_expr->const_.u32());
+            }
             break;
         }
+        case ExprType::GlobalGet:
+            // GlobalGet expressions in initializers are allowed, leave them as-is
+            break;
         default:
-            UNREACHABLE;
+            // Other expression types in initializers - just continue
+            break;
         }
     }
 }
@@ -250,8 +276,14 @@ int ProgramMain(int argc, char** argv)
         return 1;
     }
 
+    // Clear the is_64 flag from all memories
     for (auto memory: module.memories) {
         memory->page_limits.is_64 = false;
+    }
+
+    // Clear the is_64 flag from all tables (they can also have 64-bit limits in memory64)
+    for (auto table: module.tables) {
+        table->elem_limits.is_64 = false;
     }
 
     Store store;
@@ -269,12 +301,24 @@ int ProgramMain(int argc, char** argv)
         PatchInitExprs(&data->offset);
     }
 
+    // Patch element segment offsets (for table initialization)
+    for (auto elem: module.elem_segments) {
+        PatchInitExprs(&elem->offset);
+    }
+
+    // Don't patch global initializers - they should remain as-is
+    // Only data and element segments need patching for offsets
+
     result = ValidateModule(&module, &errors, ValidateOptions(features));
     if (Failed(result)) {
         std::cout << "ERROR: second validation failed\n";
         FormatErrorsToFile(errors, Location::Type::Binary);
         return 1;
     }
+
+    // Disable memory64 feature before writing the output
+    // This ensures the output binary doesn't include memory64-specific encoding
+    features.disable_memory64();
 
     MemoryStream stream(s_log_stream.get());
     s_write_binary_options.features = features;
