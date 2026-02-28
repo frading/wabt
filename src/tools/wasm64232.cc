@@ -32,6 +32,8 @@ struct Store {
     Var i64;
     Var f32;
     Var f64;
+    Var memory_copy;
+    Var memory_fill;
 };
 
 static int s_verbose;
@@ -139,21 +141,19 @@ void PatchExprList(ExprList *exprs, Store store)
             it = exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I64ExtendI32U));
             break;
         case ExprType::MemoryCopy:
-            it--;
-            it--;
-            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+            // Replace memory.copy with call to wrapper that wraps all 3 i64 args to i32.
+            // The old it-- approach broke when operands were multi-instruction sequences.
+            it = exprs->insert(it, MakeUnique<CallExpr>(Var(store.memory_copy)));
             it++;
-            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
-            it++;
-            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+            it = exprs->erase(it);
+            it--;
             break;
         case ExprType::MemoryFill:
-            it--;
-            it--;
-            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+            // Replace memory.fill with call to wrapper that wraps dest and len from i64 to i32
+            it = exprs->insert(it, MakeUnique<CallExpr>(Var(store.memory_fill)));
             it++;
-            it++;
-            exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+            it = exprs->erase(it);
+            it--;
             break;
         case ExprType::Load:
             exprs->insert(it, MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
@@ -210,6 +210,61 @@ Var GenerateWrapStoreForType(Module *module, Type type)
     func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(0, Location())));
     func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
     func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(1, Location())));
+    auto func_index = Var(module->funcs.size(), Location());
+    module->AppendField(std::move(func_field));
+    return Var(func_index);
+}
+
+// Generate wrapper: (i64, i64, i64) -> void
+// Wraps all three i64 args to i32 then calls memory.copy
+Var GenerateWrapMemoryCopy(Module *module)
+{
+    auto type_field = MakeUnique<TypeModuleField>();
+    auto func_type = MakeUnique<FuncType>();
+    func_type->sig.param_types.push_back(Type(Type::I64));
+    func_type->sig.param_types.push_back(Type(Type::I64));
+    func_type->sig.param_types.push_back(Type(Type::I64));
+    type_field->type = std::move(func_type);
+    auto func_type_index = Var(module->types.size(), Location());
+    module->AppendField(std::move(type_field));
+
+    auto func_field = MakeUnique<FuncModuleField>();
+    func_field->func.decl.has_func_type = true;
+    func_field->func.decl.type_var = func_type_index;
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(0, Location())));
+    func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(1, Location())));
+    func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(2, Location())));
+    func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+    func_field->func.exprs.push_back(MakeUnique<MemoryCopyExpr>(Var(0, Location()), Var(0, Location())));
+    auto func_index = Var(module->funcs.size(), Location());
+    module->AppendField(std::move(func_field));
+    return Var(func_index);
+}
+
+// Generate wrapper: (i64, i32, i64) -> void
+// Wraps dest and len from i64 to i32, val stays i32
+Var GenerateWrapMemoryFill(Module *module)
+{
+    auto type_field = MakeUnique<TypeModuleField>();
+    auto func_type = MakeUnique<FuncType>();
+    func_type->sig.param_types.push_back(Type(Type::I64));
+    func_type->sig.param_types.push_back(Type(Type::I32));
+    func_type->sig.param_types.push_back(Type(Type::I64));
+    type_field->type = std::move(func_type);
+    auto func_type_index = Var(module->types.size(), Location());
+    module->AppendField(std::move(type_field));
+
+    auto func_field = MakeUnique<FuncModuleField>();
+    func_field->func.decl.has_func_type = true;
+    func_field->func.decl.type_var = func_type_index;
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(0, Location())));
+    func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(1, Location())));
+    func_field->func.exprs.push_back(MakeUnique<LocalGetExpr>(Var(2, Location())));
+    func_field->func.exprs.push_back(MakeUnique<ConvertExpr>(Opcode::I32WrapI64));
+    func_field->func.exprs.push_back(MakeUnique<MemoryFillExpr>(Var(0, Location())));
     auto func_index = Var(module->funcs.size(), Location());
     module->AppendField(std::move(func_field));
     return Var(func_index);
@@ -286,15 +341,20 @@ int ProgramMain(int argc, char** argv)
         table->elem_limits.is_64 = false;
     }
 
+    // Record the original function count before generating wrappers,
+    // so we only patch original functions and not the generated wrappers.
+    Index original_func_count = module.funcs.size();
+
     Store store;
     store.i32 = GenerateWrapStoreForType(&module, Type(Type::I32));
     store.i64 = GenerateWrapStoreForType(&module, Type(Type::I64));
     store.f32 = GenerateWrapStoreForType(&module, Type(Type::F32));
     store.f64 = GenerateWrapStoreForType(&module, Type(Type::F64));
+    store.memory_copy = GenerateWrapMemoryCopy(&module);
+    store.memory_fill = GenerateWrapMemoryFill(&module);
 
-    for (auto func: module.funcs) {
-        // PatchFuncType(func);
-        PatchFunc(func, store);
+    for (Index i = 0; i < original_func_count; i++) {
+        PatchFunc(module.funcs[i], store);
     }
 
     for (auto data: module.data_segments) {
